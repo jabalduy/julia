@@ -1,0 +1,195 @@
+"""Private appointment requests API. Never log request bodies or decrypted client fields."""
+import hashlib
+import hmac
+import os
+import smtplib
+import ssl
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from pathlib import Path
+from urllib.parse import urlparse
+
+from cryptography.fernet import Fernet
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import DateTime, Integer, LargeBinary, String, create_engine, func, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from starlette.middleware.base import BaseHTTPMiddleware
+
+ROOT = Path(__file__).resolve().parents[2]
+FRONTEND = ROOT / "frontend"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgres://"):]
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgresql://"):]
+ENCRYPTION_KEY = os.environ.get("FIELD_ENCRYPTION_KEY", "")
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
+RATE_LIMIT_SECRET = os.environ.get("RATE_LIMIT_SECRET", "")
+PUBLIC_ORIGIN = os.environ.get("PUBLIC_ORIGIN", "").rstrip("/")
+EMAIL_TO = os.environ.get("NOTIFICATION_EMAIL", "")
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", "")
+
+class Base(DeclarativeBase):
+    pass
+
+class Appointment(Base):
+    __tablename__ = "appointment_requests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    name_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    contact_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    message_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    topic: Mapped[str] = mapped_column(String(32), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    notification_status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+
+engine = None
+SessionLocal = None
+cipher = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global engine, SessionLocal, cipher
+    if not DATABASE_URL or not ENCRYPTION_KEY or len(ADMIN_API_KEY) < 32 or len(RATE_LIMIT_SECRET) < 32:
+        raise RuntimeError("Configure DATABASE_URL, FIELD_ENCRYPTION_KEY, ADMIN_API_KEY (32+), RATE_LIMIT_SECRET (32+)")
+    cipher = Fernet(ENCRYPTION_KEY.encode("ascii"))
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    Base.metadata.create_all(engine)
+    yield
+    engine.dispose()
+
+app = FastAPI(title="Julia appointments", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+
+class SecurityHeaders(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/api/") else "public, max-age=300"
+        return response
+
+app.add_middleware(SecurityHeaders)
+
+class NewRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    contact: str = Field(min_length=5, max_length=160)
+    topic: str = Field(max_length=32)
+    message: str = Field(default="", max_length=2000)
+    consent: bool
+    website: str = Field(default="", max_length=200)
+
+    @field_validator("name", "contact", "message", mode="before")
+    @classmethod
+    def strip_text(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("topic")
+    @classmethod
+    def allowed_topics(cls, value):
+        if value not in {"therapy", "supervision", "education", "cooperation"}:
+            raise ValueError("Unknown topic")
+        return value
+
+def verify_same_origin(request: Request):
+    origin = request.headers.get("origin", "")
+    if origin:
+        p = urlparse(origin)
+        host = request.headers.get("host", "")
+        allowed = (p.scheme == "https" and p.netloc == host) or (PUBLIC_ORIGIN and origin == PUBLIC_ORIGIN)
+        if not allowed and not (p.scheme == "http" and p.netloc == host and host.startswith(("localhost:", "127.0.0.1:"))):
+            raise HTTPException(status_code=403, detail="Origin not allowed")
+    elif request.headers.get("sec-fetch-site", "") == "cross-site":
+        raise HTTPException(status_code=403, detail="Cross-site request rejected")
+
+def digest(value: str) -> str:
+    return hmac.new(RATE_LIMIT_SECRET.encode(), value.encode(), hashlib.sha256).hexdigest()
+
+def notify(request_id: int):
+    if not all([EMAIL_TO, SMTP_HOST, SMTP_FROM, SMTP_USERNAME, SMTP_PASSWORD]):
+        return False
+    mail = EmailMessage()
+    mail["Subject"] = f"Новая заявка на сайте Julia №{request_id}"
+    mail["From"] = SMTP_FROM
+    mail["To"] = EMAIL_TO
+    mail.set_content("Поступила новая заявка №" + str(request_id) +
+                     ". Откройте защищённый административный интерфейс/API. " +
+                     "Персональные данные в письме намеренно не передаются.")
+    if SMTP_PORT == 465:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10, context=ssl.create_default_context()) as smtp:
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(mail)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(mail)
+    return True
+
+@app.get("/api/health")
+def health():
+    return {"ok": True}
+
+@app.post("/api/requests", status_code=status.HTTP_201_CREATED)
+def create_request(data: NewRequest, request: Request):
+    verify_same_origin(request)
+    if not data.consent:
+        raise HTTPException(status_code=422, detail="Consent is required")
+    if data.website:
+        return {"ok": True}
+    # Do not save raw IP addresses; only a keyed hash, for abuse prevention.
+    visitor = digest(request.client.host if request.client else "unknown")
+    with SessionLocal() as db:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+        recent = db.scalar(select(func.count(Appointment.id)).where(
+            Appointment.request_hash == visitor, Appointment.created_at >= cutoff))
+        if recent >= 5:
+            raise HTTPException(status_code=429, detail="Too many requests. Please try later.")
+        row = Appointment(
+            name_encrypted=cipher.encrypt(data.name.encode()),
+            contact_encrypted=cipher.encrypt(data.contact.encode()),
+            message_encrypted=cipher.encrypt(data.message.encode()),
+            topic=data.topic, request_hash=visitor,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        try:
+            sent = notify(row.id)
+        except (OSError, smtplib.SMTPException):
+            sent = False
+        if sent:
+            row.notification_status = "sent"
+            db.commit()
+        return {"ok": True, "request_id": row.id}
+
+def admin_guard(x_admin_key: str | None = Header(default=None)):
+    if not x_admin_key or not hmac.compare_digest(x_admin_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+@app.get("/api/admin/requests", dependencies=[Depends(admin_guard)])
+def list_requests(limit: int = 30):
+    if not 1 <= limit <= 100:
+        raise HTTPException(status_code=422, detail="Limit must be 1..100")
+    with SessionLocal() as db:
+        rows = db.scalars(select(Appointment).order_by(Appointment.id.desc()).limit(limit)).all()
+        return {"requests": [{
+            "id": r.id, "created_at": r.created_at.isoformat(),
+            "name": cipher.decrypt(r.name_encrypted).decode(),
+            "contact": cipher.decrypt(r.contact_encrypted).decode(),
+            "message": cipher.decrypt(r.message_encrypted).decode(),
+            "topic": r.topic, "notification_status": r.notification_status
+        } for r in rows]}
+
+@app.get("/")
+def home():
+    return FileResponse(FRONTEND / "index.html", media_type="text/html")
