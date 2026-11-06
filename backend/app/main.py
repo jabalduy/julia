@@ -2,11 +2,11 @@
 import hashlib
 import hmac
 import os
-import smtplib
-import ssl
+import json
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -29,12 +29,8 @@ ENCRYPTION_KEY = os.environ.get("FIELD_ENCRYPTION_KEY", "")
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 RATE_LIMIT_SECRET = os.environ.get("RATE_LIMIT_SECRET", "")
 PUBLIC_ORIGIN = os.environ.get("PUBLIC_ORIGIN", "").rstrip("/")
-EMAIL_TO = os.environ.get("NOTIFICATION_EMAIL", "")
-SMTP_HOST = os.environ.get("SMTP_HOST", "")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
-SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-SMTP_FROM = os.environ.get("SMTP_FROM", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 class Base(DeclarativeBase):
     pass
@@ -114,26 +110,33 @@ def verify_same_origin(request: Request):
 def digest(value: str) -> str:
     return hmac.new(RATE_LIMIT_SECRET.encode(), value.encode(), hashlib.sha256).hexdigest()
 
-def notify(request_id: int):
-    if not all([EMAIL_TO, SMTP_HOST, SMTP_FROM, SMTP_USERNAME, SMTP_PASSWORD]):
+def notify(request_id: int) -> bool:
+    """Notification carries no client details."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
-    mail = EmailMessage()
-    mail["Subject"] = f"Новая заявка на сайте Julia №{request_id}"
-    mail["From"] = SMTP_FROM
-    mail["To"] = EMAIL_TO
-    mail.set_content("Поступила новая заявка №" + str(request_id) +
-                     ". Откройте защищённый административный интерфейс/API. " +
-                     "Персональные данные в письме намеренно не передаются.")
-    if SMTP_PORT == 465:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10, context=ssl.create_default_context()) as smtp:
-            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-            smtp.send_message(mail)
-    else:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
-            smtp.starttls(context=ssl.create_default_context())
-            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-            smtp.send_message(mail)
-    return True
+    endpoint = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage"
+    payload = json.dumps({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": f"Новая заявка на сайте Юлии №{request_id}. Откройте закрытую админку."
+    }).encode("utf-8")
+    req = urllib.request.Request(endpoint, payload, {"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            return bool(json.load(response).get("ok"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+
+def deliver_pending(db: Session, limit: int = 10) -> int:
+    rows = db.scalars(select(Appointment).where(
+        Appointment.notification_status == "pending").order_by(Appointment.id).limit(limit)).all()
+    sent = 0
+    for row in rows:
+        if not notify(row.id):
+            continue
+        row.notification_status = "sent"
+        db.commit()
+        sent += 1
+    return sent
 
 @app.get("/api/health")
 def health():
@@ -163,13 +166,7 @@ def create_request(data: NewRequest, request: Request):
         db.add(row)
         db.commit()
         db.refresh(row)
-        try:
-            sent = notify(row.id)
-        except (OSError, smtplib.SMTPException):
-            sent = False
-        if sent:
-            row.notification_status = "sent"
-            db.commit()
+        deliver_pending(db)
         return {"ok": True, "request_id": row.id}
 
 def admin_guard(x_admin_key: str | None = Header(default=None)):
