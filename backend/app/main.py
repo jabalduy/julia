@@ -26,7 +26,6 @@ if DATABASE_URL.startswith("postgres://"):
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgresql://"):]
 ENCRYPTION_KEY = os.environ.get("FIELD_ENCRYPTION_KEY", "")
-ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 RATE_LIMIT_SECRET = os.environ.get("RATE_LIMIT_SECRET", "")
 PUBLIC_ORIGIN = os.environ.get("PUBLIC_ORIGIN", "").rstrip("/")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -53,8 +52,8 @@ cipher = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global engine, SessionLocal, cipher
-    if not DATABASE_URL or not ENCRYPTION_KEY or len(ADMIN_API_KEY) < 32 or len(RATE_LIMIT_SECRET) < 32:
-        raise RuntimeError("Configure DATABASE_URL, FIELD_ENCRYPTION_KEY, ADMIN_API_KEY (32+), RATE_LIMIT_SECRET (32+)")
+    if not DATABASE_URL or not ENCRYPTION_KEY or len(RATE_LIMIT_SECRET) < 32:
+        raise RuntimeError("Configure DATABASE_URL, FIELD_ENCRYPTION_KEY, RATE_LIMIT_SECRET (32+)")
     cipher = Fernet(ENCRYPTION_KEY.encode("ascii"))
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
