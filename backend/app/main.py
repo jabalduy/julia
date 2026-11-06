@@ -169,24 +169,10 @@ def create_request(data: NewRequest, request: Request):
         deliver_pending(db)
         return {"ok": True, "request_id": row.id}
 
-def admin_guard(x_admin_key: str | None = Header(default=None)):
-    if not x_admin_key or not hmac.compare_digest(x_admin_key, ADMIN_API_KEY):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-@app.get("/api/admin/requests", dependencies=[Depends(admin_guard)])
-def list_requests(limit: int = 30):
-    if not 1 <= limit <= 100:
-        raise HTTPException(status_code=422, detail="Limit must be 1..100")
-    with SessionLocal() as db:
-        rows = db.scalars(select(Appointment).order_by(Appointment.id.desc()).limit(limit)).all()
-        return {"requests": [{
-            "id": r.id, "created_at": r.created_at.isoformat(),
-            "name": cipher.decrypt(r.name_encrypted).decode(),
-            "contact": cipher.decrypt(r.contact_encrypted).decode(),
-            "message": cipher.decrypt(r.message_encrypted).decode(),
-            "topic": r.topic, "notification_status": r.notification_status
-        } for r in rows]}
-
 @app.get("/")
 def home():
     return FileResponse(FRONTEND / "index.html", media_type="text/html")
+
+# Import last: models defined in admin are registered before app lifespan starts.
+from . import admin as admin_module
+app.include_router(admin_module.router)
