@@ -148,8 +148,8 @@ def create_request(data: NewRequest, request: Request):
         raise HTTPException(status_code=422, detail="Consent is required")
     if data.website:
         return {"ok": True}
-    # Do not save raw IP addresses; only a keyed hash, for abuse prevention.
-    visitor = digest(request.client.host if request.client else "unknown")
+    # Use keyed contact hash to avoid making all users behind one reverse proxy share a rate limit.
+    visitor = digest(data.contact.casefold())
     with SessionLocal() as db:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
         recent = db.scalar(select(func.count(Appointment.id)).where(
