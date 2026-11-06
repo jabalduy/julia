@@ -1,0 +1,49 @@
+name: Check secure booking app
+on:
+  push:
+    branches: [feature/secure-booking-backend]
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install backend and test dependencies
+        run: pip install -r backend/requirements.txt pytest httpx
+      - name: Run privacy and login tests
+        run: python -m pytest tests -q
+      - name: Check Python syntax
+        run: python -m compileall -q backend
+      - name: Extract and check frontend JavaScript syntax
+        run: |
+          python - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          class InlineScripts(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.inside = False
+                  self.scripts = []
+              def handle_starttag(self, tag, attrs):
+                  if tag == 'script' and not dict(attrs).get('src'):
+                      self.inside = True
+              def handle_data(self, data):
+                  if self.inside:
+                      self.scripts.append(data)
+              def handle_endtag(self, tag):
+                  if tag == 'script':
+                      self.inside = False
+          p = InlineScripts()
+          p.feed(Path('frontend/index.html').read_text(encoding='utf-8'))
+          Path('/tmp/site-script.js').write_text('\\n'.join(p.scripts), encoding='utf-8')
+          assert "fetch('/api/requests'" in Path('/tmp/site-script.js').read_text()
+          PY
+          node --check /tmp/site-script.js
+      - name: Build deployable Docker image
+        run: docker build -t julia-secure-check .

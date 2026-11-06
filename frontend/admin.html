@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Заявки — Юлия Акимова</title>
+<link rel="stylesheet" href="/admin.css">
+<script src="/admin.js" defer></script>
+</head>
+<body>
+<header><h1>Заявки · Юлия Акимова</h1><button id="logout" type="button" hidden>Выйти</button></header>
+<main>
+<section id="login-panel">
+<h2>Вход для администратора</h2>
+<p>Введите пароль и одноразовый код из приложения-аутентификатора.</p>
+<form id="login-form">
+<label>Пароль <input id="password" type="password" autocomplete="current-password" required></label>
+<label>Код 2FA <input id="otp" type="text" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" maxlength="6" required></label>
+<button type="submit">Войти</button>
+</form>
+</section>
+<section id="dashboard" hidden>
+<div class="toolbar"><h2>Заявки</h2><button id="refresh" type="button">Обновить</button><button id="retry" type="button">Повторить уведомления</button></div>
+<p class="muted">Сведения клиентов предназначены только для работы с заявками. Не пересылайте их в открытые чаты.</p>
+<div id="requests"></div>
+</section>
+<p id="feedback" role="status" aria-live="polite"></p>
+</main>
+</body>
+</html>
