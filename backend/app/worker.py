@@ -1,8 +1,7 @@
 """One-shot Telegram outbox retry. Run as a separate Railway Cron service every 5 min."""
-import os
 import sys
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
 from . import main
@@ -14,7 +13,7 @@ def run() -> int:
     engine = create_engine(main.DATABASE_URL, pool_pre_ping=True)
     try:
         with Session(engine) as db:
-            pending = db.scalar(__import__("sqlalchemy").select(__import__("sqlalchemy").func.count(main.Appointment.id)).where(
+            pending = db.scalar(select(func.count(main.Appointment.id)).where(
                 main.Appointment.notification_status == "pending"))
             sent = main.deliver_pending(db, limit=50)
             print(f"Telegram retry complete: pending_before={pending}, sent={sent}")
